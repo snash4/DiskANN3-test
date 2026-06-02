@@ -1,160 +1,73 @@
 //! Minimal DiskANN3 example: load a *disk* index from disk and run a KNN search.
 //!
-//! A DiskANN3 disk index is a set of files that share a common path prefix:
-//!     <prefix>_disk.index          (the graph + full-precision vectors)
-//!     <prefix>_pq_pivots.bin       (PQ pivot / centroid table)
-//!     <prefix>_pq_compressed.bin   (PQ-compressed vectors held in memory)
-//!
-//! The path helpers in `diskann_providers::storage` turn the prefix into those
-//! three concrete file names, so you only ever pass the prefix around.
+//! Reproduces the structure of DiskANN3's own `diskann-benchmark` disk-index
+//! job: a JSON spec deserializes into `DiskIndexOperation { source, search_phase }`,
+//! is validated, then dispatched. The `Load` source loads an existing disk index
+//! and runs the search phase over each `L` in `search_list`.
 //!
 //! Usage:
-//!     diskann3-load-index <index_prefix> <queries.fbin> [k] [L] [beam] [metric]
+//!     diskann3-bench-style <job.json>
+//!     diskann3-bench-style --print-example      # prints a sample job spec
 //!
-//!     index_prefix   path prefix of the index (no _disk.index suffix)
-//!     queries.fbin   DiskANN .fbin file: [u32 num][u32 dim][f32 num*dim]
-//!     k              neighbors to return            (default 10)
-//!     L              search-list size, must be >= k (default 100)
-//!     beam           beam width                     (default 4)
-//!     metric         l2 | cosine | mips | cosine_norm (default l2)
+//! Example job.json:
+//! {
+//!   "source":      { "disk-index-source": "Load",
+//!                    "data_type": "Float32", "load_path": "sample_index_l50_r32" },
+//!   "search_phase":{ "queries": "queries.fbin", "groundtruth": "groundtruth.ibin",
+//!                    "num_threads": 8, "beam_width": 4, "search_list": [64,128,256],
+//!                    "recall_at": 10, "is_flat_search": false, "distance": "SquaredL2",
+//!                    "vector_filters_file": null, "num_nodes_to_cache": null,
+//!                    "search_io_limit": null }
+//! }
+
+mod backend;
+mod inputs;
 
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
 
 use anyhow::{bail, Context, Result};
+use diskann_providers::storage::FileStorageProvider;
+use inputs::{DataType, DiskIndexOperation, DiskIndexSource};
 
-use diskann_disk::{
-    data_model::{AdHoc, CachingStrategy},
-    search::provider::{
-        disk_provider::DiskIndexSearcher,
-        disk_vertex_provider_factory::DiskVertexProviderFactory,
-    },
-    storage::disk_index_reader::DiskIndexReader,
-    utils::AlignedFileReaderFactory,
-};
-use diskann_providers::storage::{
-    get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, FileStorageProvider,
-};
-use diskann_utils::{io::read_bin, views::Matrix};
-use diskann_vector::distance::Metric;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!(
-            "usage: {} <index_prefix> <queries.fbin> [k] [L] [beam] [metric]",
-            args.first().map(String::as_str).unwrap_or("diskann3-load-index")
-        );
+  
+    if args.iter().any(|a| a == "--print-example") {
+        println!("{}", serde_json::to_string_pretty(&inputs::example())?);
+        return Ok(());
+    }
+    let spec_path = args.get(1).cloned().unwrap_or_else(|| {
+        eprintln!("usage: {} <job.json> | --print-example", args[0]);
         std::process::exit(2);
-    }
+    });
 
-    let index_prefix = &args[1];
-    let queries_path = &args[2];
-    let k: u32 = parse_arg(&args, 3, 10)?;
-    let l: u32 = parse_arg(&args, 4, 100)?;
-    let beam: usize = parse_arg(&args, 5, 4)?;
-    let metric = parse_metric(args.get(6).map(String::as_str).unwrap_or("l2"))?;
+    let json = std::fs::read_to_string(&spec_path)
+        .with_context(|| format!("reading job spec {spec_path}"))?;
 
-    if l < k {
-        bail!("L ({l}) must be >= k ({k})");
-    }
+    let op: DiskIndexOperation =
+        serde_json::from_str(&json).with_context(|| format!("parsing job spec {spec_path}"))?;
 
-    // --- 1. Resolve the three index files from the prefix ---------------------
-    let pivot_path = get_pq_pivot_file(index_prefix);
-    let pq_data_path = get_compressed_pq_file(index_prefix);
-    let disk_index_path = get_disk_index_file(index_prefix);
-    println!("Loading disk index:");
-    println!("  graph:        {disk_index_path}");
-    println!("  pq pivots:    {pivot_path}");
-    println!("  pq compressed:{pq_data_path}");
-
-    // FileStorageProvider reads index files straight off the local filesystem.
+    // FileStorageProvider = read index/query/gt files from the local filesystem.
     let storage = FileStorageProvider;
 
-    // --- 2. Load PQ data (pivots + compressed vectors) into memory ------------
-    // This also auto-detects the number of points from the compressed-PQ header.
-    let index_reader = DiskIndexReader::<f32>::new(pivot_path, pq_data_path, &storage)
-        .context("failed to load PQ pivot / compressed data")?;
-    println!("Loaded PQ data: {} points", index_reader.get_num_points());
+    // Validate, then dispatch on the source (Load implemented; Build rejected).
+    op.validate(&storage)?;
 
-    // --- 3. Wire up the on-disk graph reader ----------------------------------
-    // CachingStrategy::StaticCacheWithBfsNodes(n) pre-loads the n nodes nearest
-    // the entry point into RAM; None keeps everything on disk.
-    let caching_strategy = CachingStrategy::None;
-    let reader_factory = AlignedFileReaderFactory::new(disk_index_path);
-    let vertex_provider_factory = DiskVertexProviderFactory::new(reader_factory, caching_strategy)
-        .context("failed to create disk vertex provider factory")?;
-
-    // --- 4. Build the searcher ------------------------------------------------
-    // AdHoc<f32> = "f32 vectors, u32 ids, no associated payload per node".
-    // search_io_limit caps IOs per query; usize::MAX = unbounded.
-    let num_threads = 1;
-    let search_io_limit = usize::MAX;
-    let searcher = DiskIndexSearcher::<AdHoc<f32>, _>::new(
-        num_threads,
-        search_io_limit,
-        &index_reader,
-        vertex_provider_factory,
-        metric,
-        None, // let it build its own current-thread Tokio runtime
-    )
-    .context("failed to construct DiskIndexSearcher")?;
-    println!("Index loaded.\n");
-
-    // --- 5. Load queries and search the first one -----------------------------
-    // DiskANN3's own .fbin/.bin reader: 8-byte header (u32 npoints, u32 ndims)
-    // followed by row-major f32 payload. Returns a Matrix<f32>.
-    let mut reader = BufReader::new(File::open(queries_path).with_context(|| format!("opening {queries_path}"))?);
-    let queries: Matrix<f32> =
-        read_bin::<f32>(&mut reader).with_context(|| format!("reading fbin {queries_path}"))?;
-    if queries.nrows() == 0 {
-        bail!("query file contained no vectors");
+match &op.source {
+        DiskIndexSource::Load(load) => {
+            println!("Disk Index Load: prefix = {}\n", load.load_path);
+            let stats = match load.data_type {
+                DataType::Float32 => {
+                    backend::run::<f32, _>(load, &op.search_phase, &storage, &[op.search_phase.num_threads])?
+                }
+                other => bail!("this example only implements Float32 (got {other:?})"),
+            };
+            println!("\nSearch results (recall@{}, beam={}):", stats.recall_at, stats.beam_width);
+            print!("{stats}");
+        }
+        DiskIndexSource::Build(_) => bail!("`Build` source is out of scope for this example"),
     }
-    println!("Loaded {} query vector(s), dim = {}", queries.nrows(), queries.ncols());
-
-    let query: &[f32] = queries.row(0);
-    let result = searcher
-        .search(
-            query, // &[f32]
-            k,     // neighbors to return
-            l,     // search-list size
-            Some(beam),
-            None,  // no per-vector filter
-            false, // is_flat_search: false = graph search (not brute force)
-        )
-        .context("search failed")?;
-
-    println!("\nTop {k} neighbors for query 0:");
-    for (rank, item) in result.results.iter().enumerate() {
-        println!("  {:>2}. id = {:<10} distance = {:.6}", rank + 1, item.vertex_id, item.distance);
-    }
-    println!(
-        "\nstats: comparisons = {}, results = {}",
-        result.stats.cmps, result.stats.result_count
-    );
 
     Ok(())
-}
-
-fn parse_arg<T: std::str::FromStr>(args: &[String], idx: usize, default: T) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    match args.get(idx) {
-        Some(s) => s
-            .parse::<T>()
-            .map_err(|e| anyhow::anyhow!("invalid value '{s}' for arg {idx}: {e}")),
-        None => Ok(default),
-    }
-}
-
-fn parse_metric(s: &str) -> Result<Metric> {
-    Ok(match s.to_ascii_lowercase().as_str() {
-        "l2" | "euclidean" => Metric::L2,
-        "cosine" => Metric::Cosine,
-        "cosine_norm" | "cosine_normalized" => Metric::CosineNormalized,
-        "mips" | "ip" | "inner_product" => Metric::InnerProduct,
-        other => bail!("unknown metric '{other}' (use l2|cosine|mips|cosine_norm)"),
-    })
 }
