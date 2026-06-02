@@ -1,0 +1,28 @@
+[package]
+name = "DiskANN3-test"
+version = "0.1.0"
+edition = "2024"
+ 
+# This example reproduces the *shape* of DiskANN3's own benchmark driver:
+#   diskann-benchmark/src/inputs/disk.rs        -> DiskIndexSource / DiskIndexLoad / DiskSearchPhase
+#   diskann-benchmark/src/backend/disk_index/   -> search_disk_index(...)
+#
+# We redefine the same structs here and drive the real library crates:
+#   diskann            -> VectorRepr, ANN types
+#   diskann-disk       -> DiskIndexSearcher / DiskIndexReader / providers
+#   diskann-providers  -> FileStorageProvider + index-file path helpers
+#   diskann-vector     -> distance Metric
+#   diskann-utils      -> read_bin + Matrix views
+#
+# Pinned to git because the workspace (v0.53) is ahead of crates.io. Needs Rust 1.92.
+[dependencies]
+diskann            = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+diskann-disk       = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+diskann-providers  = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+diskann-vector     = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+diskann-utils      = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+bytemuck = "1.23"
+rayon      = "1.10" 
+anyhow     = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
