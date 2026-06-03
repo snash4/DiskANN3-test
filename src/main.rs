@@ -41,7 +41,6 @@ fn main() -> Result<()> {
         eprintln!("usage: {} <job.json> | --print-example", args[0]);
         std::process::exit(2);
     });
-
     let json = std::fs::read_to_string(&spec_path)
         .with_context(|| format!("reading job spec {spec_path}"))?;
 
