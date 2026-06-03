@@ -12,5 +12,5 @@ To get json format input.
 ``` cargo run --release -- --print-example > job.json```
 
 Update the parameters and run
-#### Run
-``` cargo run --release -- job.json```
+#### Run with thread sweep
+``` cargo run --release -- job.json --sweep 1,8,32,48,56```
