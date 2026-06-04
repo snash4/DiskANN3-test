@@ -13,6 +13,7 @@ edition = "2024"
 #   diskann-providers  -> FileStorageProvider + index-file path helpers
 #   diskann-vector     -> distance Metric
 #   diskann-utils      -> read_bin + Matrix views
+#   diskann-tools      -> load_truthset + calculate_recall
 #
 # Pinned to git because the workspace (v0.53) is ahead of crates.io. Needs Rust 1.92.
 [dependencies]
@@ -21,6 +22,8 @@ diskann-disk       = { git = "https://github.com/microsoft/DiskANN", branch = "m
 diskann-providers  = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
 diskann-vector     = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
 diskann-utils      = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+diskann-tools      = { git = "https://github.com/microsoft/DiskANN", branch = "main" }
+
 bytemuck = "1.23"
 rayon      = "1.10" 
 anyhow     = "1"

@@ -30,6 +30,7 @@ use diskann_disk::{
 use diskann_providers::storage::{
     get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, StorageReadProvider,
 };
+use diskann_tools::utils::{calculate_recall, load_truthset, KRecallAtN, TruthSet};
 use diskann_utils::{io::read_bin, views::Matrix};
 
 use crate::inputs::{DiskIndexLoad, DiskSearchPhase};
@@ -55,7 +56,7 @@ pub struct SweepStats {
     pub recall_at: u32,
     pub beam_width: usize,
     pub search_list: Vec<u32>,
-    pub recalls: Vec<Option<f32>>, // one per L (recall is thread-count independent)
+    pub recalls: Vec<Option<f64>>, // recall@k as a percentage (0-100); one per L
     pub rows: Vec<ThreadSweepRow>,  // one per thread count
 }
 
@@ -86,16 +87,30 @@ where
     let num_queries = queries.nrows();
     println!("Loaded {num_queries} queries, dim = {}", queries.ncols());
 
-    // Optional groundtruth (ibin: ids are non-negative, read as u32).
-    let groundtruth: Option<Matrix<u32>> = match &search.groundtruth {
-        Some(gt) => Some(
-            read_bin::<u32>(
-                &mut storage
-                    .open_reader(gt)
-                    .with_context(|| format!("opening groundtruth {gt}"))?,
-            )
-            .with_context(|| format!("reading groundtruth {gt}"))?,
-        ),
+    let k = search.recall_at;
+    let beam_width = search.beam_width;
+    let is_flat_search = search.is_flat_search;
+
+    // Optional groundtruth, loaded with DiskANN3's own truthset parser (handles
+    // the ids-only and ids+distances formats, with size validation).
+    let groundtruth: Option<TruthSet> = match &search.groundtruth {
+        Some(gt) => {
+            let ts = load_truthset(storage, gt)
+                .map_err(|e| anyhow::anyhow!("loading truthset {gt}: {e}"))?;
+            if ts.index_num_points != num_queries {
+                bail!(
+                    "truthset has {} queries but query file has {num_queries}",
+                    ts.index_num_points
+                );
+            }
+            if ts.index_dimension < k as usize {
+                bail!(
+                    "truthset has {} neighbors/query but recall_at = {k}",
+                    ts.index_dimension
+                );
+            }
+            Some(ts)
+        }
         None => None,
     };
 
@@ -127,10 +142,6 @@ where
     )
     .context("failed to construct DiskIndexSearcher")?;
     println!("Index loaded.\n");
-
-    let k = search.recall_at;
-    let beam_width = search.beam_width;
-    let is_flat_search = search.is_flat_search;
 
     // Run all queries for a given (pool, L). Reusable across thread counts.
     let run_pass = |pool: &rayon::ThreadPool, l: u32| -> Result<(PassResult, Vec<u32>)> {
@@ -179,7 +190,7 @@ where
 
     // Sweep: one rayon pool per thread count.
     let mut rows = Vec::with_capacity(thread_counts.len());
-    let mut recalls: Vec<Option<f32>> = Vec::with_capacity(search.search_list.len());
+    let mut recalls: Vec<Option<f64>> = Vec::with_capacity(search.search_list.len());
 
     for (ti, &tc) in thread_counts.iter().enumerate() {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -192,7 +203,11 @@ where
             let (pass, ids) = run_pass(&pool, l)?;
             if ti == 0 {
                 // recall is deterministic in (L, beam), so compute it once.
-                recalls.push(groundtruth.as_ref().map(|g| recall_at_k(&ids, g, num_queries, k)));
+                let recall = match &groundtruth {
+                    Some(ts) => Some(compute_recall(ts, &ids, num_queries, k)?),
+                    None => None,
+                };
+                recalls.push(recall);
             }
             passes.push(pass);
         }
@@ -209,29 +224,28 @@ where
     })
 }
 
-/// recall@k = mean over queries of |found ∩ truth[..k]| / k.
-fn recall_at_k(result_ids: &[u32], gt: &Matrix<u32>, num_queries: usize, k: u32) -> f32 {
-    let k = k as usize;
-    let gt_dim = gt.ncols();
-    let mut hits = 0usize;
-    for q in 0..num_queries {
-        let found = &result_ids[q * k..q * k + k];
-        let truth = gt.row(q);
-        let take = k.min(gt_dim);
-        for &id in &found[..take] {
-            if truth[..take].contains(&id) {
-                hits += 1;
-            }
-        }
-    }
-    hits as f32 / (num_queries * k) as f32
+/// recall@k via DiskANN3's `calculate_recall` (returns a percentage, 0-100).
+/// `result_ids` is flat with `k` ids per query; the truthset supplies the
+/// ground-truth ids (+ optional distances for tie-breaking).
+fn compute_recall(ts: &TruthSet, result_ids: &[u32], num_queries: usize, k: u32) -> Result<f64> {
+    let bounds = KRecallAtN::new(k, k).map_err(|e| anyhow::anyhow!("invalid recall bounds: {e}"))?;
+    calculate_recall::<u32>(
+        num_queries,
+        &ts.index_nodes,
+        ts.distances.as_ref(),
+        ts.index_dimension,
+        result_ids,
+        k, // dim_or: our results have k ids per query
+        bounds,
+    )
+    .map_err(|e| anyhow::anyhow!("recall calculation failed: {e}"))
 }
 
 impl std::fmt::Display for SweepStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (li, &l) in self.search_list.iter().enumerate() {
             let recall = match self.recalls.get(li).copied().flatten() {
-                Some(v) => format!("{:.4}", v),
+                Some(v) => format!("{:.2}%", v),
                 None => "n/a".to_string(),
             };
             writeln!(f, "L = {l}  (recall@{} = {recall}, beam = {})", self.recall_at, self.beam_width)?;
